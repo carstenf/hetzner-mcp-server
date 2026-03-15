@@ -1,50 +1,50 @@
 # Hetzner MCP Server
 
-Ermöglicht Claude.ai Shell-Commands auf einem Linux-Server auszuführen.
+Allows Claude.ai to execute shell commands on a Linux server via ngrok tunnel.
 
-## Wie funktioniert das?
+## How it works
 
 ```
 Claude.ai Chat
     │  (MCP Connector)
     ▼
-ngrok Tunnel (öffentliche URL)
+ngrok Tunnel (public URL)
     │
     ▼
-Dieser MCP Server (läuft dauerhaft auf dem Server)
-    │  (exec Tool)
+This MCP Server (runs as a permanent systemd service)
+    │  (exec tool)
     ▼
-Shell → alles was man im Terminal machen würde
+Shell — anything you'd do in a terminal
 ```
 
-Claude verbindet sich **nicht per SSH**. Der MCP Server läuft als
-systemd Service auf dem Server und wartet auf Anfragen von Claude.
-Einmal eingerichtet braucht man keinen Terminal mehr — Claude erledigt alles.
+Claude does **not** connect via SSH. The MCP Server runs as a systemd service
+on the server and waits for requests from Claude.
+Once set up, you never need a terminal again — Claude handles everything.
 
 ---
 
-## Einmalige Erstinstallation (nur beim ersten Mal)
+## One-time Setup (fresh server only)
 
-Da beim frischen Server noch kein MCP Server läuft, braucht man
-**einmalig** einen Terminal (z.B. Blink auf iOS oder ein SSH Client):
+Since no MCP Server is running yet on a fresh server, you need a terminal
+**once** (e.g. Blink on iOS or any SSH client):
 
 ```bash
 ssh root@<SERVER-IP>
 
-# Node.js installieren
+# Install Node.js
 curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 apt install -y nodejs git
 
-# MCP Server installieren
+# Install MCP Server
 mkdir -p /home/carsten/server/mcp-server
 cd /home/carsten/server/mcp-server
 git clone https://github.com/carstenf/hetzner-mcp-server.git .
 npm install
 
-# Als Service starten
+# Run as systemd service
 cat > /etc/systemd/system/mcp-server.service << 'SVCEOF'
 [Unit]
-Description=MCP Server
+Description=Hetzner MCP Server
 After=network.target
 [Service]
 Type=simple
@@ -59,16 +59,28 @@ SVCEOF
 systemctl enable --now mcp-server
 ```
 
-Dann ngrok einrichten und die URL in Claude.ai als Connector eintragen.
-**Ab diesem Moment übernimmt Claude alles weitere** — nginx, User, 
-weitere Services, Verzeichnisstruktur etc.
+Then set up ngrok and add the URL to Claude.ai as a connector.
+**From this point Claude handles everything else** — nginx, users,
+additional services, directory structure, etc.
 
 ---
 
-## Claude.ai Connector einrichten
+## Add Claude.ai Connector
 
 1. Claude.ai → Settings → Integrations → Add Integration
 2. Name: `Hetzner MCP`
 3. URL: `https://<NGROK-DOMAIN>/hetzner/mcp`
-4. Aktivieren → fertig
+4. Save and enable in chat
 
+---
+
+## Recommended directory structure (Claude sets this up)
+
+```
+~/server/        ← MCP server + docs + nginx/ngrok config
+~/tools/         ← Project-specific tools
+~/backtests/     ← Backtest results
+~/rag/           ← RAG systems
+~/research/      ← Analysis results
+~/code/          ← Temporary development projects
+```
