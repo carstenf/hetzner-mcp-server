@@ -19,7 +19,7 @@ const execAsync = promisify(exec);
 const app = express();
 const PORT = parseInt(process.env.MCP_PORT || '3001', 10);
 const SERVER_NAME = process.env.MCP_SERVER_NAME || 'mcp-server';
-const SERVER_VERSION = '2.0.1';
+const SERVER_VERSION = '2.0.2';
 const SUDO_PASSWORD = process.env.MCP_SUDO_PASSWORD || '';
 const WORK_CWD = process.env.MCP_WORK_CWD || '/home/carsten';
 const EXEC_TIMEOUT_MS = parseInt(process.env.MCP_EXEC_TIMEOUT_MS || '60000', 10);
@@ -38,13 +38,14 @@ app.use((req, res, next) => {
 // Helpers
 // ------------------------------------------------------------------------
 
-/** Run a command with sudo -S, feeding the password on stdin. Throws on non-zero exit. */
+/** Run a command with sudo. If MCP_SUDO_PASSWORD is set, uses `sudo -S` and pipes
+ *  the password on stdin. Otherwise uses `sudo -n` (non-interactive) which assumes
+ *  the service user has NOPASSWD in sudoers and fails clearly if not. Throws on non-zero exit. */
 function sudoExec(cmd, args, { timeoutMs = 30000 } = {}) {
   return new Promise((resolve, reject) => {
-    if (!SUDO_PASSWORD) {
-      return reject(new Error('MCP_SUDO_PASSWORD not configured; sudo operations disabled'));
-    }
-    const child = spawn('sudo', ['-S', '-p', '', cmd, ...args], {
+    const usePassword = !!SUDO_PASSWORD;
+    const sudoFlags = usePassword ? ['-S', '-p', ''] : ['-n'];
+    const child = spawn('sudo', [...sudoFlags, cmd, ...args], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
     let stdout = '';
@@ -59,9 +60,16 @@ function sudoExec(cmd, args, { timeoutMs = 30000 } = {}) {
     child.on('close', code => {
       clearTimeout(timer);
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`sudo ${cmd} exited with ${code}: ${stderr.trim() || stdout.trim()}`));
+      else {
+        const hint = !usePassword && /password is required|a password is required/i.test(stderr)
+          ? ' (hint: service user lacks NOPASSWD in sudoers, and MCP_SUDO_PASSWORD is not set)'
+          : '';
+        reject(new Error(`sudo ${cmd} exited with ${code}${hint}: ${stderr.trim() || stdout.trim()}`));
+      }
     });
-    child.stdin.write(SUDO_PASSWORD + '\n');
+    if (usePassword) {
+      child.stdin.write(SUDO_PASSWORD + '\n');
+    }
     child.stdin.end();
   });
 }
@@ -455,9 +463,14 @@ app.delete('/mcp', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-  res.json({ name: SERVER_NAME, version: SERVER_VERSION, port: PORT, sudo_enabled: !!SUDO_PASSWORD });
+  res.json({
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+    port: PORT,
+    sudo_mode: SUDO_PASSWORD ? 'password' : 'nopasswd'
+  });
 });
 
 app.listen(PORT, () => {
-  console.log(`${SERVER_NAME} v${SERVER_VERSION} listening on :${PORT} (sudo=${!!SUDO_PASSWORD ? 'on' : 'off'})`);
+  console.log(`${SERVER_NAME} v${SERVER_VERSION} listening on :${PORT} (sudo-mode=${SUDO_PASSWORD ? 'password' : 'nopasswd'})`);
 });
