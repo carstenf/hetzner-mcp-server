@@ -19,7 +19,7 @@ const execAsync = promisify(exec);
 const app = express();
 const PORT = parseInt(process.env.MCP_PORT || '3001', 10);
 const SERVER_NAME = process.env.MCP_SERVER_NAME || 'mcp-server';
-const SERVER_VERSION = '2.0.2';
+const SERVER_VERSION = '2.0.3';
 const SUDO_PASSWORD = process.env.MCP_SUDO_PASSWORD || '';
 const WORK_CWD = process.env.MCP_WORK_CWD || '/home/carsten';
 const EXEC_TIMEOUT_MS = parseInt(process.env.MCP_EXEC_TIMEOUT_MS || '60000', 10);
@@ -295,7 +295,13 @@ async function toolWriteFileSudo(args) {
     await sudoExec('cp', [staging, targetPath]);
     await sudoExec('chown', [owner, targetPath]);
     await sudoExec('chmod', [mode, targetPath]);
-    const sizeAfter = statSync(targetPath).size;
+    // Use sudo stat for size reporting since the target dir may not be readable
+    // by the service user (e.g. writing into another user's $HOME).
+    let sizeAfter = buf.length;
+    try {
+      const { stdout } = await sudoExec('stat', ['-c', '%s', targetPath]);
+      sizeAfter = parseInt(stdout.trim(), 10) || buf.length;
+    } catch { /* best effort; fall back to buf.length */ }
     return {
       content: [{
         type: 'text',
@@ -386,9 +392,28 @@ async function toolStrReplace(args) {
   } = args || {};
   if (!path) throw new Error('path is required');
   if (old_str === undefined || old_str === null) throw new Error('old_str is required');
-  if (!existsSync(path)) throw new Error(`File not found: ${path}`);
 
-  const original = readFileSync(path, 'utf-8');
+  // Read the file. In sudo mode, use `sudo cat` so we can edit files in
+  // directories where the service user lacks read access.
+  let original;
+  let sudoStUid = null, sudoStGid = null, sudoStMode = null;
+  if (sudo) {
+    try {
+      await sudoExec('test', ['-f', path]);
+    } catch {
+      throw new Error(`File not found: ${path}`);
+    }
+    const { stdout: catOut } = await sudoExec('cat', [path]);
+    original = catOut;
+    try {
+      const { stdout: statOut } = await sudoExec('stat', ['-c', '%u %g %a', path]);
+      const [u, g, m] = statOut.trim().split(/\s+/);
+      sudoStUid = parseInt(u, 10); sudoStGid = parseInt(g, 10); sudoStMode = m;
+    } catch { /* best effort */ }
+  } else {
+    if (!existsSync(path)) throw new Error(`File not found: ${path}`);
+    original = readFileSync(path, 'utf-8');
+  }
   const matches = original.split(old_str).length - 1;
   if (matches === 0) throw new Error(`old_str not found in ${path}`);
   if (matches > 1) throw new Error(`old_str matched ${matches} times in ${path}; must be unique`);
@@ -406,9 +431,8 @@ async function toolStrReplace(args) {
   }
 
   // Sudo path: stage to /tmp, sudo cp, preserve or set owner/mode
-  const st = statSync(path);
-  const finalOwner = owner ?? ownerString(st.uid, st.gid);
-  const finalMode = mode ?? ('0' + (st.mode & 0o777).toString(8));
+  const finalOwner = owner ?? (sudoStUid !== null ? ownerString(sudoStUid, sudoStGid) : 'root:root');
+  const finalMode = mode ?? (sudoStMode !== null ? '0' + sudoStMode : '0644');
   const staging = tmpStagingPath(path);
   writeFileSync(staging, updated, { mode: 0o644 });
   try {
