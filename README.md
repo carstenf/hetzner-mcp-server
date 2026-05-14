@@ -1,86 +1,86 @@
-# Hetzner MCP Server
+# mcp-server
 
-Allows Claude.ai to execute shell commands on a Linux server via ngrok tunnel.
+A Model Context Protocol (MCP) server exposing six tools to a connected agent:
 
-## How it works
+| Tool | What it does |
+|---|---|
+| `exec` | Run a shell command. |
+| `write_file` | Write a file as the MCP service user (base64-encoded content). |
+| `write_file_sudo` | Atomically write a system file requiring root. Stages to `/tmp`, then `sudo cp` + `chown` + `chmod`. |
+| `read_file` | Read a file. Optional `start_line` / `end_line` returns a slice with 1-indexed line-number prefixes (display-only). |
+| `stat_file` | Metadata + optional sha256. |
+| `str_replace` | Replace one unique substring in a text file. Fails if `old_str` is missing or non-unique. `sudo=true` writes back via `/tmp` + `sudo cp`. |
 
-```
-Claude.ai Chat
-    │  (MCP Connector)
-    ▼
-ngrok Tunnel (public URL)
-    │
-    ▼
-This MCP Server (runs as a permanent systemd service)
-    │  (exec tool)
-    ▼
-Shell — anything you'd do in a terminal
-```
+The transport is StreamableHTTP on a configurable port. The MCP SDK version is `^1.29.0`.
 
-Claude does **not** connect via SSH. The MCP Server runs as a systemd service
-on the server and waits for requests from Claude.
-Once set up, you never need a terminal again — Claude handles everything.
+## Why these tools
 
----
+The earlier version of this server exposed only `exec`, `write_file`, `read_file`, `stat_file`. An AI agent editing files through that toolset had to base64-rewrite the entire file for every change, and `sudo` operations took three round-trips (`write_file /tmp/X` → `exec sudo cp` → `exec sudo chown`). v2 adds `str_replace` (sends only the diff) and `write_file_sudo` (one round-trip for the full staged-write pattern), and gives `read_file` a `start_line` / `end_line` slice mode. The result: noticeably fewer tokens and round-trips per edit.
 
-## One-time Setup (fresh server only)
+## Configuration (environment variables)
 
-Since no MCP Server is running yet on a fresh server, you need a terminal
-**once** (e.g. Blink on iOS or any SSH client):
+| Variable | Default | Purpose |
+|---|---|---|
+| `MCP_PORT` | `3001` | HTTP port. |
+| `MCP_SERVER_NAME` | `mcp-server` | Advertised server name. Use this to distinguish multiple deployments. |
+| `MCP_SUDO_PASSWORD` | *(empty — disables sudo tools)* | Fed to `sudo -S` for `write_file_sudo` and `str_replace` with `sudo=true`. |
+| `MCP_WORK_CWD` | `/home/carsten` | Default cwd for `exec`. |
+| `MCP_EXEC_TIMEOUT_MS` | `60000` | Default per-command timeout. |
+| `MCP_EXEC_MAX_BUFFER` | `52428800` | Max stdout/stderr buffer for `exec`. |
+
+If `MCP_SUDO_PASSWORD` is unset, `write_file_sudo` and `str_replace` with `sudo=true` return a clear error rather than attempting a privileged operation.
+
+## Run locally
 
 ```bash
-ssh root@<SERVER-IP>
-
-# Install Node.js
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt install -y nodejs git
-
-# Install MCP Server
-mkdir -p /home/carsten/server/mcp-server
-cd /home/carsten/server/mcp-server
-git clone https://github.com/carstenf/hetzner-mcp-server.git .
 npm install
+MCP_SUDO_PASSWORD='...' node server.js
+# → listening on :3001
+```
 
-# Run as systemd service
-cat > /etc/systemd/system/mcp-server.service << 'SVCEOF'
+## Endpoints
+
+- `POST /mcp` — MCP StreamableHTTP transport
+- `GET /mcp`, `DELETE /mcp` — session management
+- `GET /health` — JSON: `{name, version, port, sudo_enabled}`
+
+## Deployment
+
+This repository is the single source of truth for two deployments:
+
+- **Hetzner (public)** — `MCP_SERVER_NAME=hetzner-mcp`, reachable behind Caddy + OAuth on `mcp.carstenfreek.de`.
+- **Lenovo1 (internal)** — `MCP_SERVER_NAME=lenovo1-mcp`, reachable on the WireGuard interface (`10.0.0.2:3001`).
+
+Both run from the same code; they differ only in the environment variables and the systemd unit pointing at the right working directory.
+
+Example systemd unit:
+
+```ini
 [Unit]
-Description=Hetzner MCP Server
+Description=MCP Server
 After=network.target
+
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/home/carsten/server/mcp-server
+User=carsten
+WorkingDirectory=/home/carsten/mcp-server
 ExecStart=/usr/bin/node server.js
-Restart=always
+Restart=on-failure
+RestartSec=5
+Environment=MCP_PORT=3001
+Environment=MCP_SERVER_NAME=lenovo1-mcp
+EnvironmentFile=/etc/mcp-server/secret.env   # for MCP_SUDO_PASSWORD; root-owned 0640
+
 [Install]
 WantedBy=multi-user.target
-SVCEOF
-
-systemctl enable --now mcp-server
 ```
 
-Then set up ngrok and add the URL to Claude.ai as a connector.
-**From this point Claude handles everything else** — nginx, users,
-additional services, directory structure, etc.
+## Security notes
 
----
+- `MCP_SUDO_PASSWORD` should only be loaded via systemd's `EnvironmentFile=` from a root-owned `0640` file. Never pass it as a tool argument; never log it.
+- The service should bind on a private interface (WireGuard) or sit behind a reverse proxy with authentication when run on a public host. `exec` and `write_file_sudo` would otherwise be a wide-open shell.
+- `str_replace` requires unique matches and refuses ambiguous patterns. It mirrors the contract of the sandbox `str_replace` tool.
 
-## Add Claude.ai Connector
+## License
 
-1. Claude.ai → Settings → Integrations → Add Integration
-2. Name: `Hetzner MCP`
-3. URL: `https://<NGROK-DOMAIN>/hetzner/mcp`
-4. Save and enable in chat
-
----
-
-## Recommended directory structure (Claude sets this up)
-
-```
-~/server/        ← MCP server + docs + nginx/ngrok config
-~/tools/         ← Project-specific tools
-~/backtests/     ← Backtest results
-~/rag/           ← RAG systems
-~/research/      ← Analysis results
-~/code/          ← Temporary development projects
-```
+MIT
