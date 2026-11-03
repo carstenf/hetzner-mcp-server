@@ -15,15 +15,18 @@ import { dirname, basename, resolve as pathResolve } from 'path';
 import { createHash, randomBytes } from 'crypto';
 import { tmpdir } from 'os';
 
+import { jobToolDefs, makeJobHandlers } from './jobs.js';
+
 const execAsync = promisify(exec);
 const app = express();
 const PORT = parseInt(process.env.MCP_PORT || '3001', 10);
 const SERVER_NAME = process.env.MCP_SERVER_NAME || 'mcp-server';
-const SERVER_VERSION = '2.0.3';
+const SERVER_VERSION = '2.1.0';
 const SUDO_PASSWORD = process.env.MCP_SUDO_PASSWORD || '';
 const WORK_CWD = process.env.MCP_WORK_CWD || '/home/carsten';
 const EXEC_TIMEOUT_MS = parseInt(process.env.MCP_EXEC_TIMEOUT_MS || '60000', 10);
 const EXEC_MAX_BUFFER = parseInt(process.env.MCP_EXEC_MAX_BUFFER || (50 * 1024 * 1024).toString(), 10);
+const JOB_HANDLERS = makeJobHandlers({ workCwd: WORK_CWD, sudoPassword: SUDO_PASSWORD });
 
 app.use(express.json({ limit: '50mb' }));
 app.use((req, res, next) => {
@@ -133,7 +136,8 @@ function createServer() {
           properties: {
             command: { type: 'string', description: 'Command to execute' },
             cwd: { type: 'string', description: 'Optional working directory' },
-            timeout_ms: { type: 'number', description: `Timeout in ms. Default: ${EXEC_TIMEOUT_MS}` }
+            timeout_ms: { type: 'number', description: `Timeout in ms. Default: ${EXEC_TIMEOUT_MS}` },
+            sudo: { type: 'boolean', description: 'If true, run the whole command as root via sudo (password piped from MCP_SUDO_PASSWORD). Use for commands needing root, e.g. rm/usermod/systemctl on system paths. Default: false' }
           },
           required: ['command']
         }
@@ -209,7 +213,20 @@ function createServer() {
           },
           required: ['path', 'old_str', 'new_str']
         }
-      }
+      },
+      {
+        name: 'view_image',
+        description: 'Read an image file (png/jpg/jpeg/gif/webp) and return it as a rendered image block so it can be viewed directly, without a base64 round-trip into a sandbox. Use this whenever you need to SEE an image on this server (e.g. a generated report/chart PNG). For non-image files use read_file instead.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Absolute path to the image file' },
+            max_dim: { type: 'number', description: 'Optional: downscale so the longest side is at most this many pixels (requires sharp; ignored if sharp is unavailable). Saves tokens for large images.' }
+          },
+          required: ['path']
+        }
+      },
+      ...jobToolDefs
     ]
   }));
 
@@ -219,21 +236,56 @@ function createServer() {
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+    const startedAt = Date.now();
+
+    // Structured stderr log: one JSON line per tool call. Captured by systemd
+    // journal (`journalctl -u mcp-server-v2.service`). Used for the 2026-05-22
+    // to 2026-05-29 observation phase (MASTER.md §4.2 T3, MCP-LENOVO-OBSERVATIONS.md).
+    const logCall = (outcome, extra = {}) => {
+      const argSummary = {};
+      if (args && typeof args === 'object') {
+        for (const [k, v] of Object.entries(args)) {
+          if (k === 'content_base64') argSummary[k] = `<${(v || '').length} chars b64>`;
+          else if (k === 'command') argSummary[k] = String(v).slice(0, 200);
+          else if (typeof v === 'string' && v.length > 200) argSummary[k] = v.slice(0, 200) + '...';
+          else argSummary[k] = v;
+        }
+      }
+      const entry = {
+        ts: new Date().toISOString(),
+        evt: 'tool_call',
+        tool: name,
+        args: argSummary,
+        ms: Date.now() - startedAt,
+        outcome,
+        ...extra
+      };
+      process.stderr.write(JSON.stringify(entry) + '\n');
+    };
 
     try {
+      let result;
       switch (name) {
-        case 'exec': return await toolExec(args);
-        case 'write_file': return await toolWriteFile(args);
-        case 'write_file_sudo': return await toolWriteFileSudo(args);
-        case 'read_file': return await toolReadFile(args);
-        case 'stat_file': return await toolStatFile(args);
-        case 'str_replace': return await toolStrReplace(args);
+        case 'exec': result = await toolExec(args); break;
+        case 'write_file': result = await toolWriteFile(args); break;
+        case 'write_file_sudo': result = await toolWriteFileSudo(args); break;
+        case 'read_file': result = await toolReadFile(args); break;
+        case 'stat_file': result = await toolStatFile(args); break;
+        case 'str_replace': result = await toolStrReplace(args); break;
+        case 'view_image': result = await toolViewImage(args); break;
+        case 'job_start': case 'job_status': case 'job_log': case 'job_cancel':
+          result = await JOB_HANDLERS[name](args); break;
         default:
+          logCall('unknown_tool');
           return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
       }
+      logCall('ok');
+      return result;
     } catch (err) {
+      const errMsg = err?.message || String(err);
+      logCall('error', { err: errMsg.slice(0, 500) });
       return {
-        content: [{ type: 'text', text: `Error: ${err?.message || String(err)}` }],
+        content: [{ type: 'text', text: `Error: ${errMsg}` }],
         isError: true
       };
     }
@@ -247,8 +299,38 @@ function createServer() {
 // ------------------------------------------------------------------------
 
 async function toolExec(args) {
-  const { command, cwd = WORK_CWD, timeout_ms = EXEC_TIMEOUT_MS } = args || {};
+  const { command, cwd = WORK_CWD, timeout_ms = EXEC_TIMEOUT_MS, sudo = false } = args || {};
   if (!command) throw new Error('command is required');
+  // sudo=true: run the whole command as root via `sudo -S bash -c`, piping the
+  // password (MCP_SUDO_PASSWORD) on stdin. One sudo at the front instead of
+  // scattered sudos inside the script. Falls back to `sudo -n` if no password set.
+  if (sudo) {
+    const usePassword = !!SUDO_PASSWORD;
+    const sudoFlags = usePassword ? ['-S', '-p', ''] : ['-n'];
+    return await new Promise((resolve, reject) => {
+      const child = spawn('sudo', [...sudoFlags, '/bin/bash', '-c', command], {
+        cwd, stdio: ['pipe', 'pipe', 'pipe']
+      });
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`sudo exec timed out after ${timeout_ms}ms`));
+      }, timeout_ms);
+      child.stdout.on('data', d => { stdout += d.toString(); });
+      child.stderr.on('data', d => { stderr += d.toString(); });
+      child.on('error', err => { clearTimeout(timer); reject(err); });
+      child.on('close', () => {
+        clearTimeout(timer);
+        // strip a leading empty sudo prompt line if any
+        const cleanErr = stderr.replace(/^\s*\n/, '');
+        const out = (stdout || '') + (cleanErr ? `\n[stderr]\n${cleanErr}` : '');
+        resolve({ content: [{ type: 'text', text: out || '(no output)' }] });
+      });
+      if (usePassword) child.stdin.write(SUDO_PASSWORD + '\n');
+      child.stdin.end();
+    });
+  }
   const { stdout, stderr } = await execAsync(command, {
     cwd, shell: '/bin/bash', timeout: timeout_ms, maxBuffer: EXEC_MAX_BUFFER
   });
@@ -358,6 +440,38 @@ async function toolReadFile(args) {
         truncated: capped.length < buf.length,
         content_base64: capped.toString('base64')
       })
+    }]
+  };
+}
+
+const IMAGE_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp'
+};
+
+async function toolViewImage(args) {
+  const { path, max_dim } = args || {};
+  if (!path) throw new Error('path is required');
+  if (!existsSync(path)) throw new Error(`File not found: ${path}`);
+  const ext = (path.split('.').pop() || '').toLowerCase();
+  const mimeType = IMAGE_MIME[ext];
+  if (!mimeType) throw new Error(`Unsupported image extension: .${ext} (use png/jpg/jpeg/gif/webp; for other files use read_file)`);
+
+  let buf = readFileSync(path);
+  // Optional downscale if sharp is available; silently skip otherwise.
+  if (max_dim && Number(max_dim) > 0) {
+    try {
+      const sharp = (await import('sharp')).default;
+      buf = await sharp(buf)
+        .resize({ width: Number(max_dim), height: Number(max_dim), fit: 'inside', withoutEnlargement: true })
+        .toBuffer();
+    } catch { /* sharp not installed: return original bytes */ }
+  }
+  return {
+    content: [{
+      type: 'image',
+      data: buf.toString('base64'),
+      mimeType
     }]
   };
 }
